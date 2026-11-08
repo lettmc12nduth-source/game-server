@@ -6,6 +6,9 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
+// KÍCH HOẠT BẢNG XẾP HẠNG
+require('./leaderboard')(io);
+
 const rooms = {};
 let waiting = null; // mã phòng Quick Play đang chờ người thứ 2
 
