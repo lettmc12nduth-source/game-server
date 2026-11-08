@@ -1,7 +1,6 @@
 {
-  "name": "western-bullet-clash-server",
-  "version": "1.0.0",
-  "description": "Quick Play matchmaking + relay server for Western Bullet Clash 3D",
+  "name": "game-server",
+  "version": "1.1.0",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
