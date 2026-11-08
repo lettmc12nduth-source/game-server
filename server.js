@@ -1,105 +1,104 @@
-/* =========================================================
-   Western Bullet Clash 3D — server Quick Play (Socket.io)
-   Chạy:  npm install  &&  node server.js
-   Render: Build Command = npm install · Start Command = node server.js
-
-   Giao thức (khớp với index.html):
-     client -> server : quickPlay (ack) · playerSync · playerShoot
-     server -> client : roomCreated / roomJoined {roomCode, playerIndex}
-                        matchStart · enemySync · enemyShoot · playerLeft
-   Server chỉ ghép cặp và CHUYỂN TIẾP gói tin cho đúng đối thủ. Sát thương do
-   máy bị bắn tự tính rồi gửi hp/khiên qua playerSync.
-   ========================================================= */
+/* server.js — Socket.io cho game cao bồi: quickPlay + createRoom + joinRoom
+   Client -> server: quickPlay | createRoom | joinRoom(code) | playerSync | playerShoot
+   Server -> client: roomCreated | roomJoined {roomCode, playerIndex} | roomError(msg)
+                     matchStart | enemySync | enemyShoot | playerLeft                    */
 const http = require('http');
 const { Server } = require('socket.io');
 
 const PORT = process.env.PORT || 3000;
-
-const httpServer = http.createServer((req, res) => {
-  // Endpoint kiểm tra sống (Render / UptimeRobot) + thống kê nhanh
-  res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-  res.end(JSON.stringify({ ok: true, waiting: waiting ? 1 : 0, rooms: rooms.size, online: io.engine.clientsCount }));
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Access-Control-Allow-Origin': '*' });
+  res.end('cowboy game server ok');
 });
-
-const io = new Server(httpServer, {
+const io = new Server(server, {
   cors: { origin: '*' },
-  transports: ['websocket', 'polling'],
+  maxHttpBufferSize: 1e5,
   pingInterval: 10000,
   pingTimeout: 20000,
-  maxHttpBufferSize: 1e5            // gói đồng bộ rất nhỏ, chặn dữ liệu rác
 });
 
-let waiting = null;                 // người đang chờ ghép
-const rooms = new Map();            // roomCode -> [socketA, socketB]
+const rooms = new Map();            // code -> { code, players: [socketHost, socketGuest|null] }
+let queue = [];                     // socket đang chờ ghép nhanh
+const ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';   // bỏ 0/O/1/I cho dễ đọc mã
 
-const newCode = () => {
-  let c;
-  do { c = Math.random().toString(36).slice(2, 8).toUpperCase(); } while (rooms.has(c));
-  return c;
-};
-const isObj = d => d && typeof d === 'object';
-
-function leaveRoom(socket) {
-  const code = socket.data.room;
-  if (waiting === socket) waiting = null;
-  if (!code) return;
-  socket.data.room = null;
-  socket.leave(code);
-  const room = rooms.get(code);
-  if (!room) return;
-  const other = room.find(s => s !== socket);
-  rooms.delete(code);
-  if (other && other.connected) {
-    other.emit('playerLeft');       // báo cho đối thủ; room đã xoá nên mọi gói sau đó bị bỏ qua
-    other.data.room = null;
-    other.leave(code);
+function newCode() {
+  for (;;) {
+    let c = '';
+    for (let i = 0; i < 5; i++) c += ALPHABET[Math.floor(Math.random() * ALPHABET.length)];
+    if (!rooms.has(c)) return c;
   }
 }
+const ackOf = args => args.find(a => typeof a === 'function');
+const opponent = s => {
+  const r = rooms.get(s.data.room);
+  return r ? r.players.find(p => p && p.id !== s.id) || null : null;
+};
 
-function pair(a, b) {
-  const code = newCode();
-  rooms.set(code, [a, b]);
-  a.join(code); b.join(code);
-  a.data.room = b.data.room = code;
-  a.data.index = 0; b.data.index = 1;
-  a.emit('roomCreated', { roomCode: code, playerIndex: 0 });
-  b.emit('roomJoined', { roomCode: code, playerIndex: 1 });
-  io.to(code).emit('matchStart', { roomCode: code });
-  console.log(`[match] ${code}  ${a.id} vs ${b.id}`);
+/* Rời phòng / rời hàng chờ. Có đối thủ thì báo playerLeft rồi đóng phòng. */
+function leave(s) {
+  queue = queue.filter(q => q !== s);
+  const code = s.data.room;
+  if (!code) return;
+  s.data.room = null;
+  const r = rooms.get(code);
+  if (!r) return;
+  rooms.delete(code);
+  for (const p of r.players) if (p && p !== s) { p.data.room = null; p.emit('playerLeft'); }
+}
+const startMatch = r => r.players.forEach(p => p.emit('matchStart', { roomCode: r.code }));
+
+/* PVP ghép nhanh: có người chờ thì ghép ngay, không thì vào hàng chờ */
+function quickPlay(s) {
+  leave(s);
+  queue = queue.filter(q => q.connected);
+  const mate = queue.shift();
+  if (!mate) { queue.push(s); return; }
+  const r = { code: newCode(), players: [mate, s] };
+  rooms.set(r.code, r); mate.data.room = s.data.room = r.code;
+  mate.emit('roomCreated', { roomCode: r.code, playerIndex: 0 });
+  s.emit('roomJoined', { roomCode: r.code, playerIndex: 1 });
+  startMatch(r);
+}
+
+/* TẠO PHÒNG: chủ phòng chờ, bạn nhập mã là vào */
+function createRoom(s) {
+  leave(s);
+  const r = { code: newCode(), players: [s, null] };
+  rooms.set(r.code, r); s.data.room = r.code;
+  s.emit('roomCreated', { roomCode: r.code, playerIndex: 0 });
+}
+
+/* VÀO PHÒNG: nhập mã. Đủ 2 người thì bắt đầu luôn */
+function joinRoom(s, raw) {
+  const code = String(raw || '').trim().toUpperCase().slice(0, 12);
+  leave(s);
+  const r = rooms.get(code);
+  if (!r) return s.emit('roomError', 'Không tìm thấy phòng ' + code + '.');
+  if (r.players[1] || !r.players[0] || !r.players[0].connected) return s.emit('roomError', 'Phòng đã đầy hoặc đã đóng.');
+  r.players[1] = s; s.data.room = code;
+  s.emit('roomJoined', { roomCode: code, playerIndex: 1 });
+  startMatch(r);
+}
+
+/* Chuyển dữ liệu sang đối thủ. volatile chỉ dùng khi đối thủ đang ở websocket (polling sẽ rớt gói) */
+function relay(s, ev, d, vol) {
+  const o = opponent(s);
+  if (!o || !d || typeof d !== 'object') return;
+  const ws = !!(o.conn && o.conn.transport && o.conn.transport.name === 'websocket');
+  (vol && ws ? o.volatile : o).emit(ev, d);
 }
 
 io.on('connection', socket => {
   socket.data.room = null;
+  let n = 0, t0 = Date.now();
+  const ok = () => { const now = Date.now(); if (now - t0 > 1000) { t0 = now; n = 0; } return ++n <= 200; };   // chống spam
 
-  socket.on('quickPlay', ack => {
-    if (typeof ack === 'function') ack(true);   // client dùng ack để biết server có hỗ trợ QUICK PLAY
-    leaveRoom(socket);                          // đang ở phòng cũ / đang chờ thì rời trước
-    if (waiting && waiting !== socket && waiting.connected) {
-      const other = waiting; waiting = null;
-      pair(other, socket);
-    } else {
-      waiting = socket;
-    }
-  });
-
-  // Vị trí / tư thế / hp / khiên của người gửi -> đối thủ nhận dưới tên enemySync.
-  // volatile: gói cũ bị rớt khi mạng nghẽn thay vì dồn lại gây trễ.
-  socket.on('playerSync', d => {
-    const code = socket.data.room;
-    if (!code || !isObj(d)) return;
-    socket.to(code).volatile.emit('enemySync', d);
-  });
-
-  // Phát bắn: phải đến nơi đầy đủ và đúng thứ tự -> gửi bình thường, không volatile.
-  socket.on('playerShoot', d => {
-    const code = socket.data.room;
-    if (!code || !isObj(d)) return;
-    socket.to(code).emit('enemyShoot', d);
-  });
-
-  socket.on('disconnect', () => leaveRoom(socket));
+  socket.on('quickPlay', (...a) => { const ack = ackOf(a); if (ack) ack(); if (ok()) quickPlay(socket); });
+  socket.on('createRoom', (...a) => { const ack = ackOf(a); if (ack) ack(); if (ok()) createRoom(socket); });
+  socket.on('joinRoom', (...a) => { const ack = ackOf(a); if (ack) ack(); if (ok()) joinRoom(socket, a.find(x => typeof x === 'string')); });
+  socket.on('playerSync', d => { if (ok()) relay(socket, 'enemySync', d, true); });
+  socket.on('playerShoot', d => { if (ok()) relay(socket, 'enemyShoot', d, false); });
+  socket.on('disconnect', () => leave(socket));
 });
 
-httpServer.listen(PORT, () => console.log(`Quick Play server đang chạy ở cổng ${PORT}`));
-
-module.exports = { io, httpServer, rooms };
+server.listen(PORT, () => console.log('Game server chạy ở cổng ' + PORT));
