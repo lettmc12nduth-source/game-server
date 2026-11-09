@@ -1,4 +1,4 @@
-// leaderboard.js — Bảng xếp hạng (TIỀN TRUY NÃ + HEADSHOT) cho Western Bullet Clash
+// leaderboard.js — Bảng xếp hạng (TIỀN TRUY NÃ + HEADSHOT + VÔ TẬN) cho Western Bullet Clash
 //
 // CÁCH GẮN: trong server.js, ngay sau khi tạo `io` (socket.io Server):
 //     require('./leaderboard')(io);
@@ -13,6 +13,11 @@
 // LƯU Ý QUAN TRỌNG: ổ đĩa của gói free trên Render là TẠM THỜI (mất khi server khởi động lại
 // hoặc deploy lại). Muốn BXH sống lâu, thay 2 hàm loadDb()/saveDb() bên dưới bằng DB ngoài
 // (Postgres/Redis/Mongo/Supabase...). Toàn bộ phần còn lại không cần đổi.
+//
+// BẢNG VÔ TẬN (kỷ lục wave Infinite):
+//   - lbSync nhận thêm `wave` (số nguyên >= 0). Client cũ không gửi `wave` vẫn dùng được bình thường.
+//   - lbGet trả thêm `wave: [{n, v, you, t}]` và `me.wave` (hạng của người hỏi).
+//   - Mục cũ trong file dữ liệu (chưa có trường wave) được tự nâng cấp ở lần lbSync kế tiếp.
 
 const fs = require('fs'), path = require('path'), crypto = require('crypto');
 let jwt = null; try { jwt = require('jsonwebtoken'); } catch (e) {}
@@ -20,6 +25,7 @@ let jwt = null; try { jwt = require('jsonwebtoken'); } catch (e) {}
 const FILE = process.env.LB_FILE || path.join(__dirname, 'leaderboard-data.json');
 const DEV = process.env.LB_DEV === '1';
 const TOP = 50, MAX_BOUNTY = 50000000, MAX_HS = 1000000, MAX_PLAYERS = 20000;
+const MAX_WAVE = 100000, WAVE_FIRST = 150;   // WAVE_FIRST: trần wave cho lần đồng bộ đầu tiên (người mới / mục cũ chưa có wave)
 const NAME_RE = /^[\p{L}\p{N} _.\-]{3,16}$/u;
 
 /* ---------- lưu trữ (thay 2 hàm này nếu dùng DB ngoài) ---------- */
@@ -90,26 +96,27 @@ async function who(d) {
 const authed = (p, w) => (p.type === 'guest' ? (!!w.key && p.keyHash === hash(w.key)) : true);
 
 /* ---------- bảng xếp hạng ---------- */
-let memo = { t: 0, bounty: [], headshots: [] };
+let memo = { t: 0, bounty: [], headshots: [], wave: [] };
 function tops() {
   if (Date.now() - memo.t < 5000) return memo;
   const all = Object.values(db.players);
-  const top = key => all.filter(p => p[key] > 0).sort((a, b) => b[key] - a[key] || a.t - b.t).slice(0, TOP)
+  // tk: trường thời gian dùng để xếp khi bằng điểm (ai đạt trước xếp trên)
+  const top = (key, tk) => all.filter(p => p[key] > 0).sort((a, b) => b[key] - a[key] || (a[tk] || a.t) - (b[tk] || b.t)).slice(0, TOP)
     .map(p => ({ id: p.id, n: p.name, v: p[key], t: p.type === 'guest' ? 'guest' : 'cg' }));
-  memo = { t: Date.now(), bounty: top('bounty'), headshots: top('headshots') };
+  memo = { t: Date.now(), bounty: top('bounty', 't'), headshots: top('headshots', 't'), wave: top('wave', 'wt') };
   return memo;
 }
 function prune() {
   const all = Object.values(db.players);
   if (all.length <= MAX_PLAYERS) return;
-  all.sort((a, b) => (a.bounty + a.headshots) - (b.bounty + b.headshots));
+  all.sort((a, b) => (a.bounty + a.headshots + (a.wave | 0)) - (b.bounty + b.headshots + (b.wave | 0)));
   for (const p of all.slice(0, all.length - MAX_PLAYERS)) delete db.players[p.id];
 }
 
 module.exports = function (io) {
   io.on('connection', socket => {
 
-    // Tạo / cập nhật mục của người chơi: tên + tiền truy nã + headshot
+    // Tạo / cập nhật mục của người chơi: tên + tiền truy nã + headshot + kỷ lục wave Vô Tận
     socket.on('lbSync', async (d, ack) => {
       ack = fn(ack);
       try {
@@ -123,27 +130,33 @@ module.exports = function (io) {
         if (nameTaken(name, w.id)) return ack({ ok: false, error: 'name_taken' });
 
         let bounty = Math.floor(Number(d.bounty)), hs = Math.floor(Number(d.headshots));
-        if (!(bounty >= 0 && bounty <= MAX_BOUNTY) || !(hs >= 0 && hs <= MAX_HS)) return ack({ ok: false, error: 'bad_stats' });
+        const hasWave = d.wave !== undefined && d.wave !== null;   // client cũ chưa gửi wave thì bỏ qua, không báo lỗi
+        let wave = hasWave ? Math.floor(Number(d.wave)) : 0;
+        if (!(bounty >= 0 && bounty <= MAX_BOUNTY) || !(hs >= 0 && hs <= MAX_HS) || !(wave >= 0 && wave <= MAX_WAVE)) return ack({ ok: false, error: 'bad_stats' });
 
         const now = Date.now();
         if (!p) {
           if (!newOk(ipOf(socket))) return ack({ ok: false, error: 'rate' });
-          p = db.players[w.id] = { id: w.id, type: w.type, name, bounty: 0, headshots: 0, keyHash: w.type === 'guest' ? hash(w.key) : '', t: now, upd: now };
-          bounty = Math.min(bounty, 5000000); hs = Math.min(hs, 2000);
+          p = db.players[w.id] = { id: w.id, type: w.type, name, bounty: 0, headshots: 0, wave: 0, wt: now, keyHash: w.type === 'guest' ? hash(w.key) : '', t: now, upd: now };
+          bounty = Math.min(bounty, 5000000); hs = Math.min(hs, 2000); wave = Math.min(wave, WAVE_FIRST);
           prune();
         } else {
           // chống nhảy số vô lý (client có thể bị sửa): giới hạn tốc độ tăng
           const dt = Math.max(1, (now - p.upd) / 1000);
           bounty = Math.min(bounty, p.bounty + 100000 + dt * 3000);
           hs = Math.max(p.headshots, Math.min(hs, p.headshots + 30 + Math.floor(dt * 12)));
+          const old = p.wave | 0;   // mục cũ (có từ trước khi có bảng Vô Tận) chưa có trường wave
+          wave = p.wave === undefined ? Math.min(wave, WAVE_FIRST) : Math.max(old, Math.min(wave, old + 3 + Math.floor(dt / 6)));
         }
         p.name = name; p.bounty = Math.floor(bounty); p.headshots = hs; p.upd = now;
+        if (wave > (p.wave | 0)) { p.wave = wave; p.wt = now; }
+        else if (p.wave === undefined) p.wave = 0;
         dirty = true; memo.t = 0;
         ack({ ok: true, name });
       } catch (e) { ack({ ok: false, error: 'server' }); }
     });
 
-    // Lấy top 50 của cả hai bảng (kèm hạng của người hỏi nếu gửi danh tính)
+    // Lấy top 50 của cả ba bảng (kèm hạng của người hỏi nếu gửi danh tính)
     socket.on('lbGet', async (d, ack) => {
       ack = fn(ack);
       try {
@@ -152,7 +165,7 @@ module.exports = function (io) {
         const mark = list => list.map(r => ({ n: r.n, v: r.v, t: r.t, you: !!w && r.id === w.id }));
         const me = w && db.players[w.id];
         const rank = key => (me && me[key] > 0) ? 1 + all.filter(p => p[key] > me[key]).length : 0;
-        ack({ ok: true, bounty: mark(t.bounty), headshots: mark(t.headshots), me: { bounty: rank('bounty'), headshots: rank('headshots') }, total: all.length });
+        ack({ ok: true, bounty: mark(t.bounty), headshots: mark(t.headshots), wave: mark(t.wave), me: { bounty: rank('bounty'), headshots: rank('headshots'), wave: rank('wave') }, total: all.length });
       } catch (e) { ack({ ok: false, error: 'server' }); }
     });
 
